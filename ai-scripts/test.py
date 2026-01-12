@@ -64,7 +64,7 @@ for episode in range(episodes):
     while not done:
         # Epsilon-greedy action
         if random.random() < epsilon:
-            action = env.action_space.sample()
+            action = env.action_space.sample() # random
         else:
             with torch.no_grad():
                 state_tensor = torch.FloatTensor(state)
