@@ -8,4 +8,4 @@ Die Hauptordner des Projekts sind nachfolgend mit Erläuterungen aufgeführt:
 2. **presentation** - Latex-geschriebene Dokumentation, powerpoint presentation
 3. **ai_scripts** - Python-Code für KI-Experimente, resultierende Daten und ein Jupiter-Notebook zur Visualisierung.                
 
-5. **game** - Dieser Ordner enthält das Godot-Projekt, das mit dem oben beschriebenen Setup lokal installiert werden kann. Dieser Ordner enthält den gesamten Quellcode (GdScript), Assets (Musik, Sound, Sprites), Ressourcen (.tres-Dateien) und alle Godot-spezifischen Dateien (Szenen, Konfigurationsdateien).   
+5. **game** - In diesem Ordner befindet sich das kompilierte Spiel als .exe.
