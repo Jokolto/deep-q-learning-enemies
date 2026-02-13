@@ -10,7 +10,9 @@ import random
 import numpy as np
 
 from q_learner import QLearner, SharedQLearner
-from config import ServerConfig, RewardConfig, Logger
+from deepq_learner import DQNLearner, SharedDeepQLearner
+from config import ServerConfig, QConfig, Logger
+
 
 
 Logger.init()
@@ -18,23 +20,44 @@ logging = Logger.get_logger(__name__)
 
 
 class AIServer:
-    def __init__(self, server_cfg, reward_cfg, csv_file='', run_id=0, exp_config='gen_q_learning'):
-        self.agents = {}  # enemy_id (str): QLearner
+    def __init__(self, server_cfg, q_cfg, csv_file, run_id, exp_config):
+        self.agents = {}  # enemy_id (str): QLearner | DQNLearner
         self.fitnesses = {}  # enemy_id (str) : float
-        self.shared_brain = SharedQLearner()
         self.running = True
 
         # configs
         self.server_cfg = server_cfg
-        self.reward_cfg = reward_cfg
+        self.q_cfg = q_cfg
 
-        # experiment info, not really used, as it is provided indirectly by client
+        # experiment info
         self.run_id = run_id
         self.exp_config = exp_config
 
-        # for data handling
+        # data handling
         self.csv_file = csv_file
         self.df = pd.DataFrame()
+
+        if self.exp_config in ["gen_deep_q", "deep_q"]:
+            self.shared_brain = SharedDeepQLearner(
+                state_dim=self.q_cfg.STATES_DIM,
+                action_dim=self.q_cfg.ACTIONS_DIM,
+                hidden_dim=self.server_cfg.HIDDEN_DIM,
+                discount_factor=self.server_cfg.DISCOUNT_FACTOR,
+                learning_rate=self.server_cfg.LEARNING_RATE,
+                epsilon=self.server_cfg.EPSILON,
+                mutation_sd=self.server_cfg.MUTATION_RANGE
+                )
+        
+        # other 4 configs
+        else: 
+            self.shared_brain = SharedQLearner(
+                discount_factor=self.server_cfg.DISCOUNT_FACTOR,
+                learning_rate=self.server_cfg.LEARNING_RATE,
+                epsilon=self.server_cfg.EPSILON,
+                mutation_prob=server_cfg.MUTATION_PROB,
+                mutation_sd=self.server_cfg.MUTATION_RANGE,
+                random_policy=(self.exp_config in ["base", "ga_only"])
+            )
 
     def handle_client(self, conn, addr):
         with conn:
@@ -51,6 +74,7 @@ class AIServer:
                         line, buffer = buffer.split("\n", 1)
                         if line.strip() == "":
                             continue
+
                         message = json.loads(line)
                         self.handle_message(message, conn)
                 except json.JSONDecodeError as e:
@@ -87,12 +111,18 @@ class AIServer:
             state = enemy_info["state"]
             valid_actions = enemy_info["valid_actions"]
 
-
-            agent = self.get_or_create_agent(str(enemy_id))  # q table
-
-            # Choose action based on current state and valid actions
-            random_q_condition = self.exp_config in ['base', 'ga_only'] 
-            action = agent.choose_action(state, valid_actions, random_q=random_q_condition)
+            
+            agent = self.get_or_create_agent(str(enemy_id))  # QLearner | DQNLearner
+            
+            if self.exp_config in ['deep_q', 'gen_deep_q']: # DQNLearner
+                valid_actions_indices = list(range(len(valid_actions)))
+                action_idx = agent.choose_action(state, valid_actions_indices)
+                # print(action_idx, valid_actions_indices, valid_actions)
+                action = valid_actions[action_idx]
+            elif self.exp_config == 'base':
+                action = random.choice(valid_actions)
+            else:
+                action = agent.choose_action(state, valid_actions)
 
             msg["data"][str(enemy_id)] = action
 
@@ -103,8 +133,10 @@ class AIServer:
 
 
     def handle_reward_msg(self, data):
-        if self.exp_config == 'base':
+        if self.exp_config in ['base', 'ga_only']:
             return
+
+
         for enemy_id_str, events in data.items():
             enemy_id = int(enemy_id_str)
             agent = self.get_or_create_agent(enemy_id_str)
@@ -116,8 +148,11 @@ class AIServer:
                 state_to_reward = event["state_to_reward"]
 
 
-                reward = self.reward_cfg.get(event_type)
-                
+                reward = self.q_cfg.get_reward(event_type)
+                if self.exp_config in ['deep_q', 'gen_deep_q']:
+                    action_idx = self.q_cfg.ACTIONS.index(action_to_reward)
+                    action_to_reward = action_idx  # string to int variable is crazyyy but what can i do
+
                 if reward is None:
                     logging.warning(f"Unknown event type '{event_type}' for enemy {enemy_id}, no reward applied.")
                 else:
@@ -125,32 +160,30 @@ class AIServer:
                     agent.apply_reward(reward, new_state, action_to_reward, state_to_reward)
     
     def handle_wave_end(self):
-        
-        # to see table 
-        # Q = self.agents['0'].q_table
-        # q_values = [v for actions in Q.values() for v in actions.values()]
-        # print(f"Q stats → min: {np.min(q_values):.3f}, max: {np.max(q_values):.3f}, mean: {np.mean(q_values):.3f}")
 
-        self.shared_brain.q_table = {}  # Reset shared brain
+        self.shared_brain.reset()
 
-        if self.exp_config in ["base", "q_only"]:
+        # skip selection and crossover when not using gen algorithms
+        if self.exp_config in ["base", "q_only", "deep_q"]:
             self.agents.clear()
             self.fitnesses.clear()
             return
 
-        # selection
-        top_two_ids = [k for k, v in sorted(self.fitnesses.items(), key=lambda item: item[1], reverse=True)[:2]]
-        top_two = [self.agents[enemy_id] for enemy_id in top_two_ids]
+        elif self.exp_config in ['gen_deep_q']:
+            # selection (all are selected)
+            learners = [(agent, self.fitnesses.get(agent.enemy_id, 0.0)) for agent in self.agents.values()]
 
-        # crossover + mutation
-        self.shared_brain.per_state_crossover(top_two, self.server_cfg.MUTATION_PROB, self.server_cfg.MUTATION_RANGE)
-        # print(f"shared q table: {self.shared_brain.q_table}")
-        
-        # older approach> Merge all agents' Q-tables into the shared brain
-        # learners = [(agent, self.fitnesses.get(agent.enemy_id, 0.0)) for agent in self.agents.values()]
-        # logging.debug(f"Merging {learners} into shared brain.")
-        # self.shared_brain.average_all(learners)
-        # logging.debug(f"Shared brain updated from wave. Resulting Shared Q-table: {self.shared_brain.q_table}")
+            # crossover (all, influence based on fitness)
+            self.shared_brain.crossover(learners)  
+
+
+        elif self.exp_config in ["gen_q_learning", 'ga_only']:
+            # selection (top 2)
+            top_two_ids = [k for k, v in sorted(self.fitnesses.items(), key=lambda item: item[1], reverse=True)[:2]]
+            top_two = [self.agents[enemy_id] for enemy_id in top_two_ids]
+
+            # crossover (two agents with highest fitness)
+            self.shared_brain.crossover(top_two)
         
         # Clear agents and fitnesses for the next wave
         self.agents.clear()
@@ -168,13 +201,18 @@ class AIServer:
             return
         # Expecting `data` to already be a flat dict with all columns
         self.df = pd.concat([self.df, pd.DataFrame([data])], ignore_index=True)
-        # Save every time so you don’t lose data if crash
+        # Save every time to not lose data if crash
         self.df.to_csv(self.csv_file, index=False)
 
     def get_or_create_agent(self, enemy_id: str):
         if enemy_id not in self.agents:
-            agent = copy.deepcopy(self.shared_brain)
-            agent.enemy_id = enemy_id
+            if self.exp_config in ["gen_deep_q", "gen_q_learning", "ga_only"]:
+                agent = self.shared_brain.spawn_mutated(enemy_id)
+
+            # ["deep_q", "only_q", base] - no mutation
+            else: 
+                agent = self.shared_brain.spawn(enemy_id)
+
             self.agents[enemy_id] = agent
         return self.agents[enemy_id]
     
@@ -199,14 +237,14 @@ class AIServer:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=10000)
-    parser.add_argument("--run_id", type=int, default=0)  # not really used in server currently, client sends this indirectly in data
-    parser.add_argument("--config", type=str, default='gen_q_learning') # not really used in server currently, client sends this indirectly in data
+    parser.add_argument("--run_id", type=int, default=0)  
+    parser.add_argument("--config", type=str, default='gen_deep_q')    # to change config change default to following options [ "base", "q_only",  "ga_only", "gen_q_learning", "deep_q", "gen_deep_q"]
     parser.add_argument("--learning_rate", type=float, default=0.2)
     parser.add_argument("--discount_factor", type=float, default=0.9)
-    parser.add_argument("--epsilon", type=float, default=0.2)
+    parser.add_argument("--epsilon", type=float, default=0.1)
     parser.add_argument("--mutation_prob", type=float, default=0.05)
     parser.add_argument("--mutation_range", type=float, default=0.1)
-    parser.add_argument("--output_csv", type=str, default='')
+    parser.add_argument("--output_csv", type=str, default='test.csv')
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument('--reward_dict', type=str, default='{}')
 
@@ -225,12 +263,12 @@ def main():
 
     # default now, but making possible to expand experiments with varying rewards
     reward_dict = json.loads(args.reward_dict)
-    reward_cfg = RewardConfig()
+    q_cfg = QConfig()
     if len(args.reward_dict) >= 1:
-        reward_cfg.update_rewards(reward_dict)
+        q_cfg.update_rewards(reward_dict)
    
 
-    server = AIServer(server_cfg=srv_cgf, reward_cfg=reward_cfg, csv_file=args.output_csv)
+    server = AIServer(server_cfg=srv_cgf, q_cfg=q_cfg, csv_file=args.output_csv, run_id=args.run_id, exp_config=args.config)
     signal.signal(signal.SIGINT, server.shutdown)
     server.run()
 
